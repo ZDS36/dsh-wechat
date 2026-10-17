@@ -844,19 +844,26 @@ test('the session folder is registered once and titled 微信会话', async () =
     // The desktop renders this title as the folder name; "Ungrouped" is the built-in
     // bucket a cwd-only session falls into, and it cannot be renamed.
     assert.deepEqual(harness.workspaceTitles, ['微信会话'], 'titled once, not per message')
-    assert.equal(harness.created[0].workspaceId, harness.created[1].workspaceId)
+    assert.equal(harness.created.length, 1, 'and the session is created once')
+    assert.equal(harness.created[0].workspaceId, 'workspace-wechat')
   })
 })
 
-test('a second message reuses the same session with an identical cwd', async () => {
+test('a second message continues in the same session without creating another', async () => {
+  /*
+   * The host's `create` is not an "ensure": since 0.2.1-rc.2 it reuses a named session only while it
+   * is still blank, and mints a fresh one when the named session has already run a turn. This channel
+   * works on an existing session by prompting it — `prompt` resumes a stored session itself — so
+   * calling `create` again here would leave a blank session behind on every message.
+   */
   await withHarness(async (harness) => {
     await harness.runtime.ingest(inbound('one'))
     await harness.runtime.ingest(inbound('two'))
 
-    assert.equal(harness.created.length, 2, 'the session is re-ensured, not re-created')
-    assert.equal(harness.created[0].sessionId, harness.created[1].sessionId)
-    // The same Workspace on every adopt is what keeps the session attachable.
-    assert.equal(harness.created[0].workspaceId, harness.created[1].workspaceId)
+    assert.equal(harness.created.length, 1, 'the existing session is not offered to create again')
+    assert.equal(harness.prompted.length, 2)
+    assert.equal(harness.prompted[0].sessionId, harness.created[0].sessionId)
+    assert.equal(harness.prompted[1].sessionId, harness.created[0].sessionId)
     assert.deepEqual(
       harness.prompted.map((entry) => userPart(entry.text)),
       ['one', 'two'],
@@ -1071,8 +1078,13 @@ test('a session with no record yet is kept, so messages cannot multiply sessions
     await harness.runtime.ingest(inbound('第二句'))
     await harness.runtime.ingest(inbound('第三句'))
 
-    assert.equal(harness.created.length, 3, 'the same session is re-ensured, not replaced')
+    assert.equal(harness.created.length, 2, 'only the record-less turn re-creates the same session')
     assert.deepEqual(new Set(harness.created.map((entry) => entry.sessionId)), new Set([sessionId]))
+    assert.deepEqual(
+      new Set(harness.prompted.map((entry) => entry.sessionId)),
+      new Set([sessionId]),
+      'and every message stayed in that session',
+    )
     assert.equal(harness.sent.length, 0, 'and the user is told nothing, because nothing changed')
     // The declined replacement is still written down: "why did it not repair itself" has to be
     // answerable from the log.
@@ -2397,11 +2409,13 @@ test('a position left overnight pages nothing, and a stale one is dropped', asyn
   }
 })
 
-test('a session from another workspace is adopted under its own workspace', async () => {
+test('a session from another workspace is resumed in place, not re-created', async () => {
   /*
-   * The bug this guards: `ensureSession` used the channel's workspace for everything, so a session
-   * belonging to another project could not be resumed — the host pins a session's `cwd` and rejects
-   * an adopt that names the wrong one.
+   * A stored session already records its own working directory, and `prompt` resumes it from that
+   * record — so no `create` call may name a workspace or a cwd for it. This used to be an adoption:
+   * the channel re-created the session under its own workspace first. Since 0.2.1-rc.2 a named
+   * session that has run a turn is not adopted at all, so that call would mint a blank session and
+   * leave it behind instead.
    */
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
   try {
@@ -2415,20 +2429,11 @@ test('a session from another workspace is adopted under its own workspace', asyn
       const moved = await control(harness, 'switch', '解题辅导会话')
       assert.equal(moved.ok, true, `switch failed: ${moved.detail}`)
 
-      // Adopted through a workspace of its own, not the channel's.
-      const adoption = harness.created.find((entry) => entry.sessionId === foreignId)
-      assert.ok(adoption, 'the foreign session was adopted')
-      assert.notEqual(
-        adoption.workspaceId,
-        'workspace-wechat',
-        'it must not be adopted under the channel workspace',
+      assert.equal(
+        harness.created.some((entry) => entry.sessionId === foreignId),
+        false,
+        'an existing session is never offered to create',
       )
-      // And the registry was asked about the session's own directory.
-      assert.ok(
-        harness.resolvedWorkspacePaths.some((path) => isSameWorkspace(path, foreign)),
-        `expected the foreign path to be resolved, got ${harness.resolvedWorkspacePaths.join(', ')}`,
-      )
-      assert.equal(adoption.cwd, undefined, 'a workspace id and a cwd are never sent together')
 
       // The conversation really is on it now.
       await harness.runtime.ingest(inbound('切过去之后的第一句'))
@@ -3199,7 +3204,7 @@ test('/new switches the conversation to a freshly created session', async () => 
   })
 })
 
-test('routing survives a remount: the same session is adopted again', async () => {
+test('routing survives a remount: the same session is resumed again', async () => {
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
   try {
     const first = await mount({ home, seedAccount: true })
@@ -3207,14 +3212,12 @@ test('routing survives a remount: the same session is adopted again', async () =
     const sessionId = first.prompted[0].sessionId
     first.dispose()
 
-    // A fresh mount reads the persisted binding and adopts the same session.
+    // A fresh mount reads the persisted binding and resumes the same session directly.
     const second = await mount({ home })
     await second.runtime.ingest(inbound('after restart'))
-    assert.equal(second.created.length, 1)
-    assert.equal(second.created[0].sessionId, sessionId)
-    assert.equal(second.created[0].workspaceId, 'workspace-wechat')
-    // Re-resolution goes through the same path, so the folder is unchanged.
-    assert.deepEqual(second.resolvedWorkspacePaths, [second.workspace])
+    assert.equal(second.created.length, 0, 'a stored session needs no create call')
+    assert.equal(second.prompted.at(-1)?.sessionId, sessionId)
+    assert.deepEqual(second.resolvedWorkspacePaths, [], 'and no workspace is resolved for it')
     second.dispose()
   } finally {
     await removeHome(home)
@@ -3229,13 +3232,11 @@ test('the workspace override is honoured and stays constant', async () => {
     await harness.runtime.ingest(inbound('one'))
     await harness.runtime.ingest(inbound('two'))
     // The configured directory is the one registered, and the resolution is cached: the host refuses
-    // an adopt whose workspace differs, so it must never drift. The id itself is the harness's to
-    // choose, so what matters is that both turns used the same one.
+    // a create whose workspace differs, so it must never drift.
     assert.deepEqual(harness.resolvedWorkspacePaths, [custom])
-    const ids = harness.created.map((entry) => entry.workspaceId)
-    assert.equal(ids.length, 2)
-    assert.equal(ids[0], ids[1], 'the workspace must not drift between turns')
-    assert.ok(ids[0] !== undefined && ids[0] !== '', 'a workspace was named')
+    assert.equal(harness.created.length, 1, 'the session is created once, then resumed in place')
+    const id = harness.created[0].workspaceId
+    assert.ok(id !== undefined && id !== '', 'a workspace was named')
   } finally {
     harness.dispose()
     await removeHome(home)

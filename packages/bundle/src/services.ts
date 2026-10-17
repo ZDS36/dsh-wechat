@@ -94,11 +94,12 @@ export interface SessionProjections {
 /** The subset of the session controller this plugin drives. */
 export interface SessionControllerService {
   /**
-   * Create a session with this id, or adopt the existing one.
+   * Create a session with this id.
    *
-   * Idempotent by contract, which is what makes the conversation-to-session
-   * mapping durable across host restarts. `cwd` must be identical on every call:
-   * the host rejects an adopt whose working directory differs from the stored one.
+   * The host reuses a named session only while it is still blank. Once that session has run a turn,
+   * the call mints a new session instead — the id it answers with is not the one that was asked for.
+   * So this is not an "ensure": callers check for an existing session first, and resume it through
+   * {@link SessionControllerService.prompt} rather than re-creating it.
    */
   create(request: {
     readonly sessionId?: SessionId

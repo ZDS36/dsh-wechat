@@ -3802,22 +3802,25 @@ class WechatRuntime {
     return {
       ensureSession: async (sessionId: string): Promise<void> => {
         /*
-         * Adopt the session under *its own* workspace, not the channel's.
+         * A session that already exists must not be passed to `create`.
          *
-         * The host pins a session's `cwd` for its life, so resuming a conversation that belongs to
-         * another project has to name that project's workspace. Using the channel's workspace
-         * everywhere — which this did at first — silently restricted the user to conversations
-         * created through WeChat, and made every other one fail on selection.
+         * Since 0.2.1-rc.2 `sessionController.create` only reuses a named session while it is still
+         * blank: one that has run a turn is not adopted, and a fresh session is minted instead (the
+         * id it returns is one this channel would then ignore). `ensureSession` runs before every
+         * prompt, so calling `create` here would leave a blank session behind on every message.
+         * `prompt` resumes a stored session on its own; only an id with no record at all has to be
+         * created.
          */
-        const home = (await storedSessionWorkspace(this.#home, sessionId)) ?? cwd
-        const workspaceId = await this.#workspaceIdFor(home, isSameWorkspace(home, cwd) ? WORKSPACE_TITLE : '')
+        if (await hasStoredSession(this.#home, sessionId)) return
+
+        // Naming the Workspace rather than the directory is what groups the session under a real
+        // folder; a cwd-only session lands in the desktop's unnameable "Ungrouped" bucket.
+        const workspaceId = await this.#workspaceIdFor(cwd, WORKSPACE_TITLE)
         if (workspaceId === '') {
-          await ctx.sessionController.create({ sessionId, cwd: home })
+          await ctx.sessionController.create({ sessionId, cwd })
           this.#applyPermissionPreset(sessionId)
           return
         }
-        // Naming the Workspace rather than the directory is what groups the session
-        // under a real folder; the workspace supplies the same cwd under the hood.
         await ctx.sessionController.create({ sessionId, workspaceId })
         this.#applyPermissionPreset(sessionId)
       },

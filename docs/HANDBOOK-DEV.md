@@ -1281,6 +1281,100 @@ resolveTarget('zzzzzzz', …) → { kind: 'none'  }   ← 新目标**不可能**
 
 ---
 
+## 4.20 适配内核 `0.2.1-rc.2`：`create` 不再是「create or adopt」
+
+**背景**：桌面端更新后，安装目录里的内核从 **`0.2.0-rc.2` 变成 `0.2.1-rc.2`**（`app.asar` 里的
+`@deepseek-ai/dsh`、`dsh-api-session-controller`、`dsh-client-modules`、`dsh-client-hmr`、`dsh-llm` 等全部
+是 `0.2.1-rc.2`）。**`app.asar` 不再是可读目录**：它是 182 MB 的归档（`app.asar.unpacked` 里只剩三个原生依赖），
+所以核对方式是**现场按 asar 格式只读解包**（旧的可读目录 `app.asar\dsh\...` 不再存在），并另外从 npm 取了
+`0.2.0-rc.2` 的同名包做逐文件 diff。
+
+> **`_dsh-src` 不在这个仓库里**（从未被 git 跟踪，本次核对时目录已不存在）。所以**不能**拿它当新版的真相；
+> 本节所有结论都来自安装目录的 `app.asar` 现场解包。
+
+### 逐条核对：只有一处变了
+
+| 面 | 结论 | 依据（新版 `0.2.1-rc.2`） |
+|---|---|---|
+| `sessionController.create` | ⚠️ **变了，已修** | `lib/types/commands.js`：注释改成 "reusing the named blank Session"；`lib/types/agent.js#claim`：`reusable = request.reusable(sessionId) && !observed.events.some(e => e.type === 'turn/start')`，**已跑过一轮的会话不再被采纳，而是 `createMinted` 出一个新会话** |
+| `prompt` / `cancel` / `list` | ✅ 没变 | `index.js#prompt` 仍是 `(request, signal)`、`signal.throwIfAborted()`、`mode: 'queue' \| 'steer'`；`cancel({sessionId})` 未改 |
+| `projections({sessionId})` | ✅ 没变（多一个 `kind` 字段） | `index.js` 返回 `{ kind: 'sequenced' \| 'migration-required', asOfSeq, values }`；`values.modelSelection` 形状不变，插件读的就是 `.values`；`signal` 仍必传（旧版也必传，插件一直传） |
+| `selectModel` / `UNSUPPORTED_REASONING_EFFORT` | ✅ 没变 | `lib/types/commands.js#selectModel` 在 `llm.resolveCallConfig` 之后才装选择；`dsh-llm` 的 `resolveCallWithInfo` 与旧版逐字一致：**任何网络 I/O 之前**抛 `UNSUPPORTED_REASONING_EFFORT` |
+| `modelCatalog()` | ✅ 没变 | `lib/types/catalog.js` 与旧版 `diff` 为空：`{default, routableProviders, groups, failures}` |
+| `workspaceRegistry`（`resolveByPath`/`create`/`get`/`list`/`archivedSessionIds`/`setTitle`） | ✅ 没变 | `dsh-workspace/lib/index.js` 的改动只在 `candidateMatches`/`missingSessionPaths`（启动索引容错），公开方法与 `archivedSessionIds` getter 未变 |
+| `inject` 名单（`sessionController`/`sessions`/`workspaceRegistry`/`tools`） | ✅ 没变 | 四个服务名在新 composition 里都还在：`dsh-web-app/cordis.patch.yml` 挂了 `dsh-workspace`、`dsh-api-session-controller`；`dsh-base` 挂了 `dsh-session`、`dsh-tools` |
+| `webServer.register({kind:'prefix', …})` | ✅ 没变 | `dsh-host-webserver/lib/index.js#register` 逐字未动（新版只加了 TLS/绑定地址校验） |
+| `tools.register` / `execute(args, exec)` | ✅ 没变 | `dsh-tools/lib/index.js#register` 与旧版逐字一致；`dispatchToolBody` 仍 `tool.execute(exec.arguments, exec)`，`exec.agent`/`exec.signal` 都在 |
+| `agent/assistant-stream`（`agent.session.id`、`frame.chunk.text`、`text-delta`、`end`） | ✅ 没变 | `dsh-agent-loop` 仍 `dispatch.emit("agent/assistant-stream", { frame })`，`agentEvents` 仍把 `agent` 融进 payload；`AssistantStreamAttempt` 的 `start/chunk/end` 帧结构与旧版相同 |
+| `approval/request` / `user-questions/request` | ✅ 没变 | `dsh-user-approval/lib/index.js` 与旧版**逐字相同**；`dsh-user-questions` 的 `questionSchema`/`answerSchema`（`{id, selected, custom?}`）未变 |
+| `permissionPresets.set(session, name)` | ✅ 没变 | `dsh-permission-presets` 的签名与 `set` 未变（改动在 typert 生成层） |
+| `ctx.get('homePaths')` | ✅ 从来不是服务（旧版也不是） | 新旧 `dsh-home-paths` 都只导出纯函数；插件一直走 `DSH_HOME` → `homedir()/.dsh` 的回退 |
+| 客户端 `slots.inject` / `register` / `onEntryError` | ✅ 没变 | `@deepseek-ai/dsh-client-ui-slots` **0.2.1-rc.2 与 0.2.0-rc.2 字节相同**（`index.js` 同为 23461 B，`diff` 为空）；`inject` 文档仍是「声明已存在时同步调用」；`onEntryError(fn)` 签名仍是 `(key, registration, error, { abdicated })` |
+| `settings.section` 槽位 | ✅ 没变 | `dsh-client-ui-settings-general` 仍在 `apply` 时注册 `sidebar.settings` 条目，并在 `children` 里声明 `settings.section`；`registerOptions` 仍是 `{id(required), order, label(可 thunk)}` |
+| 客户端 classic script / `dsh.client.immediately` | ✅ 没变 | `dsh-client-modules/lib/client.js` 仍 `document.createElement("script")` 外链加载；`parseDshClient` 仍读 `dsh.client.platform/immediately`；`client.js` 的 IIFE 外壳**必须保留** |
+| 磁盘：`storages/workspace.json` 的 `global.archivedSessionIds` | ✅ 没变 | 本机实际文件仍有 `global.archivedSessionIds`（3 条） |
+| 磁盘：`storages/session_projcache/sessions/*.json` 的 `rows.sessionListMetadata.val.lastPromptAt` 与 `identity.createdAt` | ✅ 没变 | 实测 191 个条目，字段路径不变（另有 `rows.title.val`、`identity.cwd`） |
+| 磁盘：会话目录 `sessions/<encoded-cwd>/<session-id>/` | ✅ 没变 | 实测目录仍是 `--C-...--/session-<uuid>`（workspace 注册创建的仍有裸 uuid 形态，插件两种都试） |
+| `~/.dsh/wechat/state.json` | ✅ 自己的格式，未受影响 | 插件的 `normalize()`/往返测试全绿 |
+
+### 变的是什么：`create` 只复用「还空着的」会话
+
+旧版 `ApiSessionAgentController.ensureSession(sessionId, cwd, true, preset)` 的语义是 **create or adopt**：
+只要磁盘上有这个 id，就 `agents.resume` 它，返回**同一个**会话。新版 `createSession` → `claim` 改成：
+
+```js
+reusable = request.reusable(sessionId) && !observed.events.some(e => e.type === 'turn/start')
+if (!reusable) return this.createMinted(request.cwd, composition)   // ← 新的 id
+```
+
+也就是说：**已经跑过一轮的会话不会被采纳**，`create` 会**另造一个空会话**并把新 id 作为返回值。
+插件的 `ensureSession` 原来在**每条消息**之前调用 `create` 来「确保会话活着」（旧版这就是 adopt），
+并且**丢弃返回值**、继续用原 id `prompt`。在新版上这会变成：
+
+- 用户的消息仍然进原会话（`prompt` 自己会 `resume`，所以聊天看起来正常）；
+- 但**每条消息都留下一个空会话**（还被 `attachSession` 到工作区）。
+
+### 修法：存在就什么都不做
+
+`packages/bundle/src/host.ts` 的 `#gateway().ensureSession` 开头加一行：
+
+```ts
+if (await hasStoredSession(this.#home, sessionId)) return
+```
+
+- **有记录 = `prompt` 能自己 resume**，不需要 `create`；**没有记录**（`#bind` 刚 mint 的 id、或记录被删）
+  才 `create` —— 而且此时 `create` 的 `claim` 走 `SESSION_QUERY_SESSION_NOT_FOUND` → `createAgent(sessionId)`，
+  **仍按请求的 id 创建**，不会改名。
+- 顺带删掉了为「adopt 到别的项目工作区」服务的那段分支：它只在 `create` 会 resume 旧会话时才有意义；
+  现在既有会话根本不进 `create`，`storedSessionWorkspace` 在这条路径上恒为 `undefined`。
+- **没有做新旧双形状兼容**：判定只看「会话是否存在」，与宿主版本无关。
+
+### 验证
+
+- 更新/新增的断言（`plugin.test.ts`）：
+  | 测试 | 断言 |
+  |---|---|
+  | a second message continues in the same session without creating another | 两条消息只 `create` 一次，两条 prompt 都指向它 |
+  | the session folder is registered once and titled 微信会话 | 标题只设一次、只创建一个会话 |
+  | a session with no record yet is kept… | 记录被删后**只重建同一个 id**，此后不再 create；三条 prompt 同一会话 |
+  | a session from another workspace is resumed in place, not re-created | 切到外部会话**不**调 `create`，下一条 prompt 落在那个 id |
+  | routing survives a remount… | 重启后**不** create，`prompt` 直接 resume 原会话 |
+  | the workspace override is honoured and stays constant | 自定义工作区只解析、只创建一次 |
+- **反向验证**：把那一行守卫改成 `if (false) return` → 上面 6 条**全部变红**（其余 114 条仍绿）；恢复后
+  `test:plugin` 120/120，全套 **316 通过 0 失败**，`build` / `typecheck` 均 exit 0。
+
+### 没把握的地方（如实记录）
+
+- **没有真机验证**（装插件 → 扫码 → 发消息）。本轮只能证明代码与契约；宿主升级改的是服务行为，
+  这一步按 §7.8 仍然欠着。
+- **只核对了内核 `0.2.1-rc.2`**，桌面壳版本（`app.asar/package.json` 里 `@deepseek-ai/dsh-desktop-runtime`
+  也是 `0.2.1-rc.2`）没有独立核对。
+- **一个边角**：`hasStoredSession()` 把「有 projcache 行」也算存在。若某台机器出现**行还在、会话目录没了**
+  的损坏状态，现在会跳过 `create`，于是 `prompt` 报 `session/not-found`（旧版会顺手重建）。检测到这种状态
+  需要额外的目录探测，**本次没有做**——它属于损坏存储，不是正常路径。
+
+---
+
 ## 5. 认证：OIDC，不要用 token
 
 **工作流里没有任何密钥。** 用 GitHub 签发的 OIDC 身份向 npm 证明"我确实是这个仓库的这条工作流"。
